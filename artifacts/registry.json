@@ -1,0 +1,19 @@
+{
+  "production_version": "v_migrated_20260811T121745Z",
+  "last_trained_version": "v_migrated_20260811T121745Z",
+  "last_check_utc": "2026-08-11T12:17:45.434018+00:00",
+  "last_training_row_count": 1680,
+  "last_trained_at_utc": "2026-08-11T12:17:45.433666+00:00",
+  "history": [
+    {
+      "version": "v_migrated_20260811T121745Z",
+      "trained_at_utc": "2026-08-11T12:17:45.433666+00:00",
+      "promoted": true,
+      "reason": "migrated from legacy layout",
+      "mean_test_mae_by_horizon": {
+        "7": 54.90504145390841,
+        "28": 81.06021421788523
+      }
+    }
+  ]
+}
