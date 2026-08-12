@@ -42,7 +42,6 @@ from .features import HORIZONS, TARGET, add_features, make_supervised_dataset
 from .ingest import load_canonical
 
 warnings.filterwarnings("ignore")
-
 SEED = 42
 np.random.seed(SEED)
 
@@ -154,6 +153,27 @@ def make_ga_svr(params):
     ])
 
 
+class PrefittedScalerMultiOutput:
+    """Minimal predict-only multi-output model: applies one shared,
+    already-fitted scaler, then each forecast step's own already-fitted
+    SVR. Used for the production refit instead of sklearn's Pipeline +
+    MultiOutputRegressor specifically because both of those refit every
+    step's scaler from whatever X is passed to .fit() — which would undo
+    the point of fitting the scaler on the full feature-row range (see the
+    comment in train_all_horizons where this is constructed). Must live at
+    module level (not nested in a function) so joblib/pickle can resolve
+    it by import path when loading a saved model.
+    """
+
+    def __init__(self, scaler: StandardScaler, estimators: list):
+        self.scaler = scaler
+        self.estimators_ = estimators
+
+    def predict(self, X):
+        Xs = self.scaler.transform(X)
+        return np.column_stack([est.predict(Xs) for est in self.estimators_])
+
+
 def eval_regression(y_true, y_pred, label=""):
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -253,8 +273,34 @@ def train_all_horizons(df: pd.DataFrame | None = None, horizons=HORIZONS,
         residual_std = residuals.std(axis=0)
 
         print(f"  Refitting GA-SVR on full dataset for production (H={H})...")
-        prod_model = MultiOutputRegressor(make_ga_svr(best_params), n_jobs=-1)
-        prod_model.fit(ds["X"], ds["y"])
+        # IMPORTANT: ds["X"]/ds["y"] necessarily exclude the last H rows of
+        # history_df — a row needs H future days of target to form a
+        # complete y vector, so the most recent H rows never appear in
+        # ds["X"]. But latest_feature_row() (used at forecast time) anchors
+        # on exactly those most-recent rows. If the StandardScaler inside
+        # the production pipeline is fit only on ds["X"], the live anchor
+        # row can land many standard deviations outside anything the scaler
+        # or the RBF kernel ever saw — which saturates the kernel and
+        # collapses the forecast to a near-constant value regardless of
+        # the actual input (visible as "the forecast looks identical from
+        # one day to the next" even though real new data came in).
+        #
+        # Fix: fit the scaler on the FULL feature-row range (all rows with
+        # complete features, including the trailing ones with no complete
+        # y yet), so the scaler's — and therefore the kernel's — notion of
+        # "normal" already covers where forecasts are actually served from.
+        # The SVR itself still only ever trains on rows with real targets.
+        full_feat_rows = df_feat.dropna(subset=[c for c in ds["fcols"] if c in df_feat.columns])
+        X_full_range = full_feat_rows[ds["fcols"]].values
+
+        prod_scaler = StandardScaler().fit(X_full_range)
+        prod_estimators = []
+        for step_idx in range(H):
+            svr = SVR(kernel="rbf", C=best_params[0], gamma=best_params[1], epsilon=best_params[2])
+            svr.fit(prod_scaler.transform(ds["X"]), ds["y"][:, step_idx])
+            prod_estimators.append(svr)
+
+        prod_model = PrefittedScalerMultiOutput(prod_scaler, prod_estimators)
 
         model_path = out_dir / f"model_h{H}.pkl"
         joblib.dump(prod_model, model_path, compress=3)
