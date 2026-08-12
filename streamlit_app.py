@@ -44,8 +44,8 @@ from pipeline.features import (
     add_features,
     latest_feature_row,
 )
-from pipeline.ingest import ALL_VALUE_COLS, add_row, load_canonical
-from pipeline.retrain_check import load_registry, should_retrain
+from pipeline.ingest import ALL_VALUE_COLS, CANONICAL_PATH, add_row, load_canonical
+from pipeline.retrain_check import REGISTRY_PATH, load_registry, should_retrain
 
 ARTIFACTS_ROOT = Path(__file__).parent / "artifacts"
 
@@ -55,18 +55,39 @@ st.set_page_config(page_title="Dengue Forecast Dashboard", layout="wide", page_i
 # ==========================================================================
 # LOADERS (cached)
 # ==========================================================================
-@st.cache_data(ttl=300)
-def load_canonical_cached():
+# All caches below are keyed off the source file's mtime, not a time-based
+# TTL. This matters specifically because this is a CONTINUOUS pipeline: new
+# data or a newly promoted model can land on disk at any moment (the daily
+# GitHub Action, scheduler.py, or another user editing data in-app), and a
+# plain ttl=N cache would keep serving stale content for up to N seconds
+# after that regardless of whether anything actually changed. Passing the
+# mtime as a cache key means Streamlit only recomputes when the file's
+# content has genuinely changed, and does so immediately rather than on a
+# timer — while still not re-reading the file on every single rerun.
+def _mtime(path: Path) -> float:
+    return path.stat().st_mtime if path.exists() else 0.0
+
+
+@st.cache_data
+def _load_canonical_at(mtime: float):
     return load_canonical()
 
 
-@st.cache_data(ttl=60)
-def load_registry_cached():
+def load_canonical_cached():
+    return _load_canonical_at(_mtime(CANONICAL_PATH))
+
+
+@st.cache_data
+def _load_registry_at(mtime: float):
     return load_registry()
 
 
+def load_registry_cached():
+    return _load_registry_at(_mtime(REGISTRY_PATH))
+
+
 @st.cache_resource
-def load_model_bundle(version: str, horizon: int):
+def _load_model_bundle_at(version: str, horizon: int, mtime: float):
     v_dir = ARTIFACTS_ROOT / version
     model = joblib.load(v_dir / f"model_h{horizon}.pkl")
     fcols = json.loads((v_dir / f"feature_columns_h{horizon}.json").read_text())
@@ -75,25 +96,44 @@ def load_model_bundle(version: str, horizon: int):
     return model, fcols, residual_std, ga_params
 
 
-@st.cache_data(ttl=60)
-def load_version_metadata(version: str):
+def load_model_bundle(version: str, horizon: int):
+    model_path = ARTIFACTS_ROOT / version / f"model_h{horizon}.pkl"
+    return _load_model_bundle_at(version, horizon, _mtime(model_path))
+
+
+@st.cache_data
+def _load_version_metadata_at(version: str, mtime: float):
     path = ARTIFACTS_ROOT / version / "model_metadata.json"
     if not path.exists():
         return {}
     return json.loads(path.read_text())
 
 
-@st.cache_data(ttl=60)
-def load_version_metrics(version: str):
+def load_version_metadata(version: str):
+    path = ARTIFACTS_ROOT / version / "model_metadata.json"
+    return _load_version_metadata_at(version, _mtime(path))
+
+
+@st.cache_data
+def _load_version_metrics_at(version: str, mtime: float):
     path = ARTIFACTS_ROOT / version / "test_metrics.csv"
     if not path.exists():
         return pd.DataFrame()
     return pd.read_csv(path)
 
 
+def load_version_metrics(version: str):
+    path = ARTIFACTS_ROOT / version / "test_metrics.csv"
+    return _load_version_metrics_at(version, _mtime(path))
+
+
 def clear_data_caches():
-    load_canonical_cached.clear()
-    load_registry_cached.clear()
+    """Still useful right after this session's own writes (e.g. the data
+    editor's Save button) to guarantee an immediate re-read within the same
+    rerun, even though the mtime-keyed caches above would also pick up the
+    change on the next rerun regardless."""
+    _load_canonical_at.clear()
+    _load_registry_at.clear()
 
 
 # ==========================================================================
